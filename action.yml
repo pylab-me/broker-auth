@@ -1,0 +1,296 @@
+name: Broker Auth
+description: Exchange GitHub Actions OIDC identity with broker and optionally request a repo-read grant.
+
+inputs:
+  broker_url:
+    description: Auth broker base URL
+    required: true
+  project:
+    description: Project id configured in broker policy for this repository
+    required: true
+  broker_audience:
+    description: OIDC audience expected by the broker
+    required: false
+    default: cfw-zhi-auth-center
+  user_agent:
+    description: User-Agent header sent to broker endpoints
+    required: false
+    default: auth-broker-x-ci/1.0
+  target_repo:
+    description: Optional repository to request repo-read access for
+    required: false
+    default: ""
+  probe_healthz:
+    description: Whether to probe broker healthz before broker API calls
+    required: false
+    default: "true"
+
+outputs:
+  session_id:
+    description: Broker session id
+    value: ${{ steps.exchange.outputs.session_id }}
+  broker_session_id:
+    description: Namespaced alias of broker session id
+    value: ${{ steps.exchange.outputs.session_id }}
+  grant_id:
+    description: Repo-read grant id when target_repo is provided
+    value: ${{ steps.repo_read.outputs.grant_id }}
+  repo_read_grant_id:
+    description: Namespaced alias of repo-read grant id
+    value: ${{ steps.repo_read.outputs.grant_id }}
+  repo:
+    description: Repository returned by the broker repo-read grant
+    value: ${{ steps.repo_read.outputs.repo }}
+  repo_read_repo:
+    description: Namespaced alias of repository returned by repo-read grant
+    value: ${{ steps.repo_read.outputs.repo }}
+  token:
+    description: Temporary GitHub App installation token when target_repo is provided
+    value: ${{ steps.repo_read.outputs.token }}
+  repo_read_token:
+    description: Namespaced alias of temporary GitHub App installation token
+    value: ${{ steps.repo_read.outputs.token }}
+  expires_at:
+    description: Expiration timestamp of the repo-read token
+    value: ${{ steps.repo_read.outputs.expires_at }}
+  repo_read_expires_at:
+    description: Namespaced alias of repo-read token expiration timestamp
+    value: ${{ steps.repo_read.outputs.expires_at }}
+
+runs:
+  using: composite
+  steps:
+    - name: Probe broker reachability
+      if: ${{ inputs.probe_healthz == 'true' }}
+      shell: bash
+      env:
+        BROKER_URL: ${{ inputs.broker_url }}
+        BROKER_USER_AGENT: ${{ inputs.user_agent }}
+      run: |
+        set -euo pipefail
+
+        reject_header_value() {
+          local name="$1"
+          local value="$2"
+
+          if [[ "$value" == *$'\r'* || "$value" == *$'\n'* ]]; then
+            echo "${name} must not contain CR/LF" >&2
+            exit 1
+          fi
+        }
+
+        if [[ ! "$BROKER_URL" =~ ^https://[^[:space:]]+$ ]]; then
+          echo "broker_url must be an https URL" >&2
+          exit 1
+        fi
+
+        reject_header_value "BROKER_USER_AGENT" "$BROKER_USER_AGENT"
+
+        set +e
+        HEALTH_STATUS=$(curl -sS \
+          --connect-timeout 10 \
+          --max-time 30 \
+          --retry 2 \
+          --retry-delay 1 \
+          --retry-connrefused \
+          -o /dev/null \
+          -w "%{http_code}" \
+          -H "User-Agent: ${BROKER_USER_AGENT}" \
+          "${BROKER_URL%/}/healthz")
+        CURL_EXIT=$?
+        set -e
+
+        echo "curl_exit=${CURL_EXIT}"
+        echo "broker_health_status=${HEALTH_STATUS}"
+
+    - name: Exchange workflow identity with broker
+      id: exchange
+      shell: bash
+      env:
+        BROKER_URL: ${{ inputs.broker_url }}
+        PROJECT: ${{ inputs.project }}
+        BROKER_AUDIENCE: ${{ inputs.broker_audience }}
+        BROKER_USER_AGENT: ${{ inputs.user_agent }}
+        SOURCE_REPOSITORY: ${{ github.repository }}
+        GIT_REF: ${{ github.ref }}
+        WORKFLOW_NAME: ${{ github.workflow }}
+        RUN_ID: ${{ github.run_id }}
+        ACTOR: ${{ github.actor }}
+        COMMIT_SHA: ${{ github.sha }}
+      run: |
+        set -euo pipefail
+
+        reject_header_value() {
+          local name="$1"
+          local value="$2"
+
+          if [[ "$value" == *$'\r'* || "$value" == *$'\n'* ]]; then
+            echo "${name} must not contain CR/LF" >&2
+            exit 1
+          fi
+        }
+
+        if [[ ! "$BROKER_URL" =~ ^https://[^[:space:]]+$ ]]; then
+          echo "broker_url must be an https URL" >&2
+          exit 1
+        fi
+
+        reject_header_value "BROKER_USER_AGENT" "$BROKER_USER_AGENT"
+
+        WORK_DIR="$(mktemp -d "${RUNNER_TEMP:-/tmp}/broker-auth.XXXXXX")"
+        chmod 700 "$WORK_DIR"
+        trap 'rm -rf "$WORK_DIR"' EXIT
+
+        OIDC_RESPONSE=$(curl -sS \
+          --connect-timeout 10 \
+          --max-time 60 \
+          --retry 2 \
+          --retry-delay 1 \
+          --retry-connrefused \
+          -G \
+          -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          --data-urlencode "audience=${BROKER_AUDIENCE}" \
+          "$ACTIONS_ID_TOKEN_REQUEST_URL")
+        OIDC_TOKEN=$(echo "$OIDC_RESPONSE" | jq -r '.value')
+
+        if [[ -z "$OIDC_TOKEN" || "$OIDC_TOKEN" == "null" ]]; then
+          echo "Failed to resolve OIDC token from GitHub Actions runtime" >&2
+          echo "$OIDC_RESPONSE" | jq -r '.message // "oidc token request failed"' >&2 || true
+          exit 1
+        fi
+
+        echo "::add-mask::${OIDC_TOKEN}"
+
+        EXCHANGE_PAYLOAD=$(jq -nc \
+          --arg project "$PROJECT" \
+          --arg repository "$SOURCE_REPOSITORY" \
+          --arg ref "$GIT_REF" \
+          --arg workflow "$WORKFLOW_NAME" \
+          --arg run_id "$RUN_ID" \
+          --arg actor "$ACTOR" \
+          --arg sha "$COMMIT_SHA" \
+          --arg oidc_token "$OIDC_TOKEN" \
+          '{
+            provider: "github-actions",
+            project: $project,
+            repository: $repository,
+            ref: $ref,
+            workflow: $workflow,
+            run_id: $run_id,
+            actor: $actor,
+            sha: $sha,
+            oidc_token: $oidc_token
+          }')
+
+        EXCHANGE_STATUS=$(curl -sS \
+          --connect-timeout 10 \
+          --max-time 60 \
+          --retry 2 \
+          --retry-delay 1 \
+          --retry-connrefused \
+          -o "$WORK_DIR/broker-exchange-body.json" \
+          -w "%{http_code}" \
+          -X POST "${BROKER_URL%/}/v1/ci/exchange" \
+          -H "Content-Type: application/json" \
+          -H "Accept: application/json" \
+          -H "User-Agent: ${BROKER_USER_AGENT}" \
+          --data "$EXCHANGE_PAYLOAD")
+
+        if [[ "$EXCHANGE_STATUS" != "200" ]]; then
+          echo "broker_status=${EXCHANGE_STATUS}" >&2
+          jq -r '.error // .message // "broker exchange failed"' "$WORK_DIR/broker-exchange-body.json" >&2 || true
+          exit 1
+        fi
+
+        SESSION_ID=$(jq -r '.session_id' "$WORK_DIR/broker-exchange-body.json")
+        if [[ -z "$SESSION_ID" || "$SESSION_ID" == "null" ]]; then
+          echo "Broker exchange response did not include session_id" >&2
+          exit 1
+        fi
+
+        echo "::add-mask::${SESSION_ID}"
+        echo "session_id=${SESSION_ID}" >> "$GITHUB_OUTPUT"
+
+    - name: Request repo-read grant
+      id: repo_read
+      if: ${{ inputs.target_repo != '' }}
+      shell: bash
+      env:
+        BROKER_URL: ${{ inputs.broker_url }}
+        PROJECT: ${{ inputs.project }}
+        SESSION_ID: ${{ steps.exchange.outputs.session_id }}
+        TARGET_REPO: ${{ inputs.target_repo }}
+        BROKER_USER_AGENT: ${{ inputs.user_agent }}
+      run: |
+        set -euo pipefail
+
+        reject_header_value() {
+          local name="$1"
+          local value="$2"
+
+          if [[ "$value" == *$'\r'* || "$value" == *$'\n'* ]]; then
+            echo "${name} must not contain CR/LF" >&2
+            exit 1
+          fi
+        }
+
+        if [[ ! "$BROKER_URL" =~ ^https://[^[:space:]]+$ ]]; then
+          echo "broker_url must be an https URL" >&2
+          exit 1
+        fi
+
+        reject_header_value "BROKER_USER_AGENT" "$BROKER_USER_AGENT"
+
+        WORK_DIR="$(mktemp -d "${RUNNER_TEMP:-/tmp}/broker-auth-repo-read.XXXXXX")"
+        chmod 700 "$WORK_DIR"
+        trap 'rm -rf "$WORK_DIR"' EXIT
+
+        REPO_READ_PAYLOAD=$(jq -nc \
+          --arg session_id "$SESSION_ID" \
+          --arg project "$PROJECT" \
+          --arg target_repo "$TARGET_REPO" \
+          '{
+            session_id: $session_id,
+            project: $project,
+            target_repo: $target_repo
+          }')
+
+        REPO_READ_STATUS=$(curl -sS \
+          --connect-timeout 10 \
+          --max-time 60 \
+          --retry 2 \
+          --retry-delay 1 \
+          --retry-connrefused \
+          -o "$WORK_DIR/broker-repo-read-body.json" \
+          -w "%{http_code}" \
+          -X POST "${BROKER_URL%/}/v1/grants/repo-read" \
+          -H "Content-Type: application/json" \
+          -H "Accept: application/json" \
+          -H "User-Agent: ${BROKER_USER_AGENT}" \
+          --data "$REPO_READ_PAYLOAD")
+
+        if [[ "$REPO_READ_STATUS" != "200" ]]; then
+          echo "broker_status=${REPO_READ_STATUS}" >&2
+          jq -r '.error // .message // "broker repo-read request failed"' "$WORK_DIR/broker-repo-read-body.json" >&2 || true
+          exit 1
+        fi
+
+        GRANT_ID=$(jq -r '.grant_id' "$WORK_DIR/broker-repo-read-body.json")
+        REPO=$(jq -r '.repo' "$WORK_DIR/broker-repo-read-body.json")
+        TOKEN=$(jq -r '.token' "$WORK_DIR/broker-repo-read-body.json")
+        EXPIRES_AT=$(jq -r '.expires_at' "$WORK_DIR/broker-repo-read-body.json")
+
+        if [[ -z "$TOKEN" || "$TOKEN" == "null" ]]; then
+          echo "Broker repo-read response did not include token" >&2
+          exit 1
+        fi
+
+        echo "::add-mask::${SESSION_ID}"
+        echo "::add-mask::${TOKEN}"
+
+        {
+          echo "grant_id=${GRANT_ID}"
+          echo "repo=${REPO}"
+          echo "token=${TOKEN}"
+          echo "expires_at=${EXPIRES_AT}"
+        } >> "$GITHUB_OUTPUT"
