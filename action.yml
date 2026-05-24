@@ -69,6 +69,20 @@ runs:
       run: |
         set -euo pipefail
 
+        print_error_response() {
+          local response_file="$1"
+          local fallback_message="$2"
+
+          if jq -e . >/dev/null 2>&1 < "$response_file"; then
+            jq -r '.error // empty, .message // empty, (if .details then (.details | tojson) else empty end)' \
+              "$response_file" >&2 || true
+            return
+          fi
+
+          echo "$fallback_message" >&2
+          sed -n '1,40p' "$response_file" >&2 || true
+        }
+
         reject_header_value() {
           local name="$1"
           local value="$2"
@@ -198,7 +212,7 @@ runs:
 
         if [[ "$EXCHANGE_STATUS" != "200" ]]; then
           echo "broker_status=${EXCHANGE_STATUS}" >&2
-          jq -r '.error // .message // "broker exchange failed"' "$WORK_DIR/broker-exchange-body.json" >&2 || true
+          print_error_response "$WORK_DIR/broker-exchange-body.json" "broker exchange failed with a non-JSON response"
           exit 1
         fi
 
@@ -223,6 +237,20 @@ runs:
         BROKER_USER_AGENT: ${{ inputs.user_agent }}
       run: |
         set -euo pipefail
+
+        print_error_response() {
+          local response_file="$1"
+          local fallback_message="$2"
+
+          if jq -e . >/dev/null 2>&1 < "$response_file"; then
+            jq -r '.error // empty, .message // empty, (if .details then (.details | tojson) else empty end)' \
+              "$response_file" >&2 || true
+            return
+          fi
+
+          echo "$fallback_message" >&2
+          sed -n '1,40p' "$response_file" >&2 || true
+        }
 
         reject_header_value() {
           local name="$1"
@@ -271,7 +299,7 @@ runs:
 
         if [[ "$REPO_READ_STATUS" != "200" ]]; then
           echo "broker_status=${REPO_READ_STATUS}" >&2
-          jq -r '.error // .message // "broker repo-read request failed"' "$WORK_DIR/broker-repo-read-body.json" >&2 || true
+          print_error_response "$WORK_DIR/broker-repo-read-body.json" "broker repo-read request failed with a non-JSON response"
           exit 1
         fi
 
