@@ -1,324 +1,140 @@
-name: Broker Auth
-description: Exchange GitHub Actions OIDC identity with broker and optionally request a repo-read grant.
+name: Broker Auth CI Bridge
+description: Exchange GitHub Actions OIDC identity through Auth Broker and optionally mint a short-lived repo-read grant.
 
 inputs:
   broker_url:
-    description: Auth broker base URL
+    description: Auth Broker base URL. Must be HTTPS.
     required: true
+
   project:
-    description: Project id configured in broker policy for this repository
+    description: Project id configured in the Auth Broker policy for this repository.
     required: true
+
   broker_audience:
-    description: OIDC audience expected by the broker
+    description: OIDC audience expected by Auth Broker.
     required: false
     default: cfw-zhi-auth-center
+
   user_agent:
-    description: User-Agent header sent to broker endpoints
+    description: User-Agent header sent to Auth Broker endpoints.
     required: false
     default: auth-broker-x-ci/1.0
+
   target_repo:
-    description: Optional repository to request repo-read access for
+    description: Optional owner/repo target to request a repo-read grant for.
     required: false
     default: ""
+
   probe_healthz:
-    description: Whether to probe broker healthz before broker API calls
+    description: Probe /healthz before broker API calls. This is diagnostic-only and does not fail the action.
     required: false
     default: "true"
 
+  cf_access_client_id:
+    description: Optional Cloudflare Access service token Client ID.
+    required: false
+    default: ""
+
+  cf_access_client_secret:
+    description: Optional Cloudflare Access service token Client Secret.
+    required: false
+    default: ""
+
+  setup_python:
+    description: Run actions/setup-python before executing the Python sidecar.
+    required: false
+    default: "true"
+
+  python_version:
+    description: Python version passed to actions/setup-python. Defaults to Python 3.14.
+    required: false
+    default: "3.14"
+
 outputs:
   session_id:
-    description: Broker session id
-    value: ${{ steps.exchange.outputs.session_id }}
+    description: Broker session id.
+    value: ${{ steps.broker_auth.outputs.session_id }}
+
   broker_session_id:
-    description: Namespaced alias of broker session id
-    value: ${{ steps.exchange.outputs.session_id }}
+    description: Namespaced alias of broker session id.
+    value: ${{ steps.broker_auth.outputs.session_id }}
+
   grant_id:
-    description: Repo-read grant id when target_repo is provided
-    value: ${{ steps.repo_read.outputs.grant_id }}
+    description: Repo-read grant id when target_repo is provided.
+    value: ${{ steps.broker_auth.outputs.grant_id }}
+
   repo_read_grant_id:
-    description: Namespaced alias of repo-read grant id
-    value: ${{ steps.repo_read.outputs.grant_id }}
+    description: Namespaced alias of repo-read grant id.
+    value: ${{ steps.broker_auth.outputs.grant_id }}
+
   repo:
-    description: Repository returned by the broker repo-read grant
-    value: ${{ steps.repo_read.outputs.repo }}
+    description: Repository returned by the broker repo-read grant.
+    value: ${{ steps.broker_auth.outputs.repo }}
+
   repo_read_repo:
-    description: Namespaced alias of repository returned by repo-read grant
-    value: ${{ steps.repo_read.outputs.repo }}
+    description: Namespaced alias of repository returned by repo-read grant.
+    value: ${{ steps.broker_auth.outputs.repo }}
+
   token:
-    description: Temporary GitHub App installation token when target_repo is provided
-    value: ${{ steps.repo_read.outputs.token }}
+    description: Temporary GitHub App installation token when target_repo is provided.
+    value: ${{ steps.broker_auth.outputs.token }}
+
   repo_read_token:
-    description: Namespaced alias of temporary GitHub App installation token
-    value: ${{ steps.repo_read.outputs.token }}
+    description: Namespaced alias of temporary GitHub App installation token.
+    value: ${{ steps.broker_auth.outputs.token }}
+
   expires_at:
-    description: Expiration timestamp of the repo-read token
-    value: ${{ steps.repo_read.outputs.expires_at }}
+    description: Expiration timestamp of the repo-read token.
+    value: ${{ steps.broker_auth.outputs.expires_at }}
+
   repo_read_expires_at:
-    description: Namespaced alias of repo-read token expiration timestamp
-    value: ${{ steps.repo_read.outputs.expires_at }}
+    description: Namespaced alias of repo-read token expiration timestamp.
+    value: ${{ steps.broker_auth.outputs.expires_at }}
 
 runs:
   using: composite
   steps:
-    - name: Probe broker reachability
-      if: ${{ inputs.probe_healthz == 'true' }}
-      shell: bash
-      env:
-        BROKER_URL: ${{ inputs.broker_url }}
-        BROKER_USER_AGENT: ${{ inputs.user_agent }}
-      run: |
-        set -euo pipefail
+    - name: Set up Python ${{ inputs.python_version }}
+      if: ${{ inputs.setup_python == 'true' }}
+      uses: actions/setup-python@v6
+      with:
+        python-version: ${{ inputs.python_version }}
 
-        print_error_response() {
-          local response_file="$1"
-          local fallback_message="$2"
-
-          if jq -e . >/dev/null 2>&1 < "$response_file"; then
-            jq -r '.error // empty, .message // empty, (if .details then (.details | tojson) else empty end)' \
-              "$response_file" >&2 || true
-            return
-          fi
-
-          echo "$fallback_message" >&2
-          sed -n '1,40p' "$response_file" >&2 || true
-        }
-
-        reject_header_value() {
-          local name="$1"
-          local value="$2"
-
-          if [[ "$value" == *$'\r'* || "$value" == *$'\n'* ]]; then
-            echo "${name} must not contain CR/LF" >&2
-            exit 1
-          fi
-        }
-
-        if [[ ! "$BROKER_URL" =~ ^https://[^[:space:]]+$ ]]; then
-          echo "broker_url must be an https URL" >&2
-          exit 1
-        fi
-
-        reject_header_value "BROKER_USER_AGENT" "$BROKER_USER_AGENT"
-
-        set +e
-        HEALTH_STATUS=$(curl -sS \
-          --connect-timeout 10 \
-          --max-time 30 \
-          --retry 2 \
-          --retry-delay 1 \
-          --retry-connrefused \
-          -o /dev/null \
-          -w "%{http_code}" \
-          -H "User-Agent: ${BROKER_USER_AGENT}" \
-          "${BROKER_URL%/}/healthz")
-        CURL_EXIT=$?
-        set -e
-
-        echo "curl_exit=${CURL_EXIT}"
-        echo "broker_health_status=${HEALTH_STATUS}"
-
-    - name: Exchange workflow identity with broker
-      id: exchange
+    - name: Run Auth Broker Python sidecar
+      id: broker_auth
       shell: bash
       env:
         BROKER_URL: ${{ inputs.broker_url }}
         PROJECT: ${{ inputs.project }}
         BROKER_AUDIENCE: ${{ inputs.broker_audience }}
         BROKER_USER_AGENT: ${{ inputs.user_agent }}
+        TARGET_REPO: ${{ inputs.target_repo }}
+        PROBE_HEALTHZ: ${{ inputs.probe_healthz }}
+
+        CF_ACCESS_CLIENT_ID: ${{ inputs.cf_access_client_id }}
+        CF_ACCESS_CLIENT_SECRET: ${{ inputs.cf_access_client_secret }}
+
         SOURCE_REPOSITORY: ${{ github.repository }}
         GIT_REF: ${{ github.ref }}
         WORKFLOW_NAME: ${{ github.workflow }}
         RUN_ID: ${{ github.run_id }}
         ACTOR: ${{ github.actor }}
         COMMIT_SHA: ${{ github.sha }}
+
+        REQUIRED_PYTHON_PREFIX: ${{ inputs.python_version }}
       run: |
         set -euo pipefail
 
-        reject_header_value() {
-          local name="$1"
-          local value="$2"
-
-          if [[ "$value" == *$'\r'* || "$value" == *$'\n'* ]]; then
-            echo "${name} must not contain CR/LF" >&2
-            exit 1
-          fi
-        }
-
-        if [[ ! "$BROKER_URL" =~ ^https://[^[:space:]]+$ ]]; then
-          echo "broker_url must be an https URL" >&2
+        if command -v python >/dev/null 2>&1; then
+          PYTHON_BIN=python
+        elif command -v python3.14 >/dev/null 2>&1; then
+          PYTHON_BIN=python3.14
+        elif command -v python3 >/dev/null 2>&1; then
+          PYTHON_BIN=python3
+        else
+          echo "python is required to run this action" >&2
           exit 1
         fi
 
-        reject_header_value "BROKER_USER_AGENT" "$BROKER_USER_AGENT"
-
-        WORK_DIR="$(mktemp -d "${RUNNER_TEMP:-/tmp}/broker-auth.XXXXXX")"
-        chmod 700 "$WORK_DIR"
-        trap 'rm -rf "$WORK_DIR"' EXIT
-
-        OIDC_RESPONSE=$(curl -sS \
-          --connect-timeout 10 \
-          --max-time 60 \
-          --retry 2 \
-          --retry-delay 1 \
-          --retry-connrefused \
-          -G \
-          -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-          --data-urlencode "audience=${BROKER_AUDIENCE}" \
-          "$ACTIONS_ID_TOKEN_REQUEST_URL")
-        OIDC_TOKEN=$(echo "$OIDC_RESPONSE" | jq -r '.value')
-
-        if [[ -z "$OIDC_TOKEN" || "$OIDC_TOKEN" == "null" ]]; then
-          echo "Failed to resolve OIDC token from GitHub Actions runtime" >&2
-          echo "$OIDC_RESPONSE" | jq -r '.message // "oidc token request failed"' >&2 || true
-          exit 1
-        fi
-
-        echo "::add-mask::${OIDC_TOKEN}"
-
-        EXCHANGE_PAYLOAD=$(jq -nc \
-          --arg project "$PROJECT" \
-          --arg repository "$SOURCE_REPOSITORY" \
-          --arg ref "$GIT_REF" \
-          --arg workflow "$WORKFLOW_NAME" \
-          --arg run_id "$RUN_ID" \
-          --arg actor "$ACTOR" \
-          --arg sha "$COMMIT_SHA" \
-          --arg oidc_token "$OIDC_TOKEN" \
-          '{
-            provider: "github-actions",
-            project: $project,
-            repository: $repository,
-            ref: $ref,
-            workflow: $workflow,
-            run_id: $run_id,
-            actor: $actor,
-            sha: $sha,
-            oidc_token: $oidc_token
-          }')
-
-        EXCHANGE_STATUS=$(curl -sS \
-          --connect-timeout 10 \
-          --max-time 60 \
-          --retry 2 \
-          --retry-delay 1 \
-          --retry-connrefused \
-          -o "$WORK_DIR/broker-exchange-body.json" \
-          -w "%{http_code}" \
-          -X POST "${BROKER_URL%/}/v1/ci/exchange" \
-          -H "Content-Type: application/json" \
-          -H "Accept: application/json" \
-          -H "User-Agent: ${BROKER_USER_AGENT}" \
-          --data "$EXCHANGE_PAYLOAD")
-
-        if [[ "$EXCHANGE_STATUS" != "200" ]]; then
-          echo "broker_status=${EXCHANGE_STATUS}" >&2
-          print_error_response "$WORK_DIR/broker-exchange-body.json" "broker exchange failed with a non-JSON response"
-          exit 1
-        fi
-
-        SESSION_ID=$(jq -r '.session_id' "$WORK_DIR/broker-exchange-body.json")
-        if [[ -z "$SESSION_ID" || "$SESSION_ID" == "null" ]]; then
-          echo "Broker exchange response did not include session_id" >&2
-          exit 1
-        fi
-
-        echo "::add-mask::${SESSION_ID}"
-        echo "session_id=${SESSION_ID}" >> "$GITHUB_OUTPUT"
-
-    - name: Request repo-read grant
-      id: repo_read
-      if: ${{ inputs.target_repo != '' }}
-      shell: bash
-      env:
-        BROKER_URL: ${{ inputs.broker_url }}
-        PROJECT: ${{ inputs.project }}
-        SESSION_ID: ${{ steps.exchange.outputs.session_id }}
-        TARGET_REPO: ${{ inputs.target_repo }}
-        BROKER_USER_AGENT: ${{ inputs.user_agent }}
-      run: |
-        set -euo pipefail
-
-        print_error_response() {
-          local response_file="$1"
-          local fallback_message="$2"
-
-          if jq -e . >/dev/null 2>&1 < "$response_file"; then
-            jq -r '.error // empty, .message // empty, (if .details then (.details | tojson) else empty end)' \
-              "$response_file" >&2 || true
-            return
-          fi
-
-          echo "$fallback_message" >&2
-          sed -n '1,40p' "$response_file" >&2 || true
-        }
-
-        reject_header_value() {
-          local name="$1"
-          local value="$2"
-
-          if [[ "$value" == *$'\r'* || "$value" == *$'\n'* ]]; then
-            echo "${name} must not contain CR/LF" >&2
-            exit 1
-          fi
-        }
-
-        if [[ ! "$BROKER_URL" =~ ^https://[^[:space:]]+$ ]]; then
-          echo "broker_url must be an https URL" >&2
-          exit 1
-        fi
-
-        reject_header_value "BROKER_USER_AGENT" "$BROKER_USER_AGENT"
-
-        WORK_DIR="$(mktemp -d "${RUNNER_TEMP:-/tmp}/broker-auth-repo-read.XXXXXX")"
-        chmod 700 "$WORK_DIR"
-        trap 'rm -rf "$WORK_DIR"' EXIT
-
-        REPO_READ_PAYLOAD=$(jq -nc \
-          --arg session_id "$SESSION_ID" \
-          --arg project "$PROJECT" \
-          --arg target_repo "$TARGET_REPO" \
-          '{
-            session_id: $session_id,
-            project: $project,
-            target_repo: $target_repo
-          }')
-
-        REPO_READ_STATUS=$(curl -sS \
-          --connect-timeout 10 \
-          --max-time 60 \
-          --retry 2 \
-          --retry-delay 1 \
-          --retry-connrefused \
-          -o "$WORK_DIR/broker-repo-read-body.json" \
-          -w "%{http_code}" \
-          -X POST "${BROKER_URL%/}/v1/grants/repo-read" \
-          -H "Content-Type: application/json" \
-          -H "Accept: application/json" \
-          -H "User-Agent: ${BROKER_USER_AGENT}" \
-          --data "$REPO_READ_PAYLOAD")
-
-        if [[ "$REPO_READ_STATUS" != "200" ]]; then
-          echo "broker_status=${REPO_READ_STATUS}" >&2
-          print_error_response "$WORK_DIR/broker-repo-read-body.json" "broker repo-read request failed with a non-JSON response"
-          exit 1
-        fi
-
-        GRANT_ID=$(jq -r '.grant_id' "$WORK_DIR/broker-repo-read-body.json")
-        REPO=$(jq -r '.repo' "$WORK_DIR/broker-repo-read-body.json")
-        TOKEN=$(jq -r '.token' "$WORK_DIR/broker-repo-read-body.json")
-        EXPIRES_AT=$(jq -r '.expires_at' "$WORK_DIR/broker-repo-read-body.json")
-
-        if [[ -z "$TOKEN" || "$TOKEN" == "null" ]]; then
-          echo "Broker repo-read response did not include token" >&2
-          exit 1
-        fi
-
-        echo "::add-mask::${SESSION_ID}"
-        echo "::add-mask::${TOKEN}"
-
-        {
-          echo "grant_id=${GRANT_ID}"
-          echo "repo=${REPO}"
-          echo "token=${TOKEN}"
-          echo "expires_at=${EXPIRES_AT}"
-        } >> "$GITHUB_OUTPUT"
+        "$PYTHON_BIN" -c 'import sys; print("python=" + sys.version.split()[0])'
+        "$PYTHON_BIN" "${{ github.action_path }}/scripts/broker_auth.py"
