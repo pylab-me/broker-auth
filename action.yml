@@ -1,5 +1,5 @@
 name: Broker Auth CI Bridge
-description: Exchange GitHub Actions OIDC identity through Auth Broker and optionally mint a short-lived repo-read grant.
+description: Exchange or reuse a Broker session and request a separate repo-read grant for each target repository.
 
 inputs:
   broker_url:
@@ -21,7 +21,12 @@ inputs:
     default: auth-broker-x-ci/1.0
 
   target_repo:
-    description: Optional owner/repo target to request a repo-read grant for.
+    description: Optional owner/repo targets, one per line or comma-separated. Each receives its own grant and token using the same session.
+    required: false
+    default: ""
+
+  session_id:
+    description: Optional existing Broker session for this project. Skips OIDC exchange when provided; the Broker validates its project and expiry.
     required: false
     default: ""
 
@@ -51,6 +56,10 @@ inputs:
     default: "3.14"
 
 outputs:
+  repo_read_grants_json:
+    description: JSON object keyed by owner/repo, with grant_id, repo, token, and expires_at for each target. Contains credentials; do not log it.
+    value: ${{ steps.broker_auth.outputs.repo_read_grants_json }}
+
   session_id:
     description: Broker session id.
     value: ${{ steps.broker_auth.outputs.session_id }}
@@ -60,7 +69,7 @@ outputs:
     value: ${{ steps.broker_auth.outputs.session_id }}
 
   grant_id:
-    description: Repo-read grant id when target_repo is provided.
+    description: Repo-read grant id when exactly one target is requested; empty for zero or multiple targets.
     value: ${{ steps.broker_auth.outputs.grant_id }}
 
   repo_read_grant_id:
@@ -68,7 +77,7 @@ outputs:
     value: ${{ steps.broker_auth.outputs.grant_id }}
 
   repo:
-    description: Repository returned by the broker repo-read grant.
+    description: Repository returned when exactly one target is requested; empty for zero or multiple targets.
     value: ${{ steps.broker_auth.outputs.repo }}
 
   repo_read_repo:
@@ -76,7 +85,7 @@ outputs:
     value: ${{ steps.broker_auth.outputs.repo }}
 
   token:
-    description: Temporary GitHub App installation token when target_repo is provided.
+    description: Temporary GitHub App token when exactly one target is requested; use repo_read_grants_json for multiple targets.
     value: ${{ steps.broker_auth.outputs.token }}
 
   repo_read_token:
@@ -84,7 +93,7 @@ outputs:
     value: ${{ steps.broker_auth.outputs.token }}
 
   expires_at:
-    description: Expiration timestamp of the repo-read token.
+    description: Token expiration when exactly one target is requested; empty for zero or multiple targets.
     value: ${{ steps.broker_auth.outputs.expires_at }}
 
   repo_read_expires_at:
@@ -109,6 +118,7 @@ runs:
         BROKER_AUDIENCE: ${{ inputs.broker_audience }}
         BROKER_USER_AGENT: ${{ inputs.user_agent }}
         TARGET_REPO: ${{ inputs.target_repo }}
+        BROKER_SESSION_ID: ${{ inputs.session_id }}
         PROBE_HEALTHZ: ${{ inputs.probe_healthz }}
 
         CF_ACCESS_CLIENT_ID: ${{ inputs.cf_access_client_id }}

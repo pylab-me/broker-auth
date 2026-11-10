@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import ssl
 import sys
 import time
@@ -55,9 +56,7 @@ def validate_python_version() -> None:
     # input to something else, do not over-police it here.
     if required.startswith("3.14"):
         if sys.version_info < (3, 14) or sys.version_info >= (3, 15):
-            raise SystemExit(
-                f"Python 3.14.x is required by this action; got {sys.version.split()[0]}"
-            )
+            raise SystemExit(f"Python 3.14.x is required by this action; got {sys.version.split()[0]}")
 
 
 def normalize_base_url(value: str) -> str:
@@ -171,7 +170,9 @@ def http_request(
 
         if attempt < MAX_ATTEMPTS and is_retryable(last_status, last_err):
             delay = min(2 ** (attempt - 1), 4)
-            eprint(f"request retrying attempt={attempt + 1}/{MAX_ATTEMPTS} method={method} status={last_status} delay_s={delay}")
+            eprint(
+                f"request retrying attempt={attempt + 1}/{MAX_ATTEMPTS} method={method} status={last_status} delay_s={delay}"
+            )
             time.sleep(delay)
             continue
         break
@@ -204,10 +205,14 @@ def print_status_diagnostic(status: int | None, headers: dict[str, str], body: b
 
     if status == 403 and has_cf and not has_access:
         eprint("diagnostic=Cloudflare returned 403 and CF Access service-token headers were not configured.")
-        eprint("diagnostic_hint=pass cf_access_client_id and cf_access_client_secret, then add a narrow WAF Skip rule for broker CI endpoints.")
+        eprint(
+            "diagnostic_hint=pass cf_access_client_id and cf_access_client_secret, then add a narrow WAF Skip rule for broker CI endpoints."
+        )
     elif status == 403 and has_cf and has_access:
         eprint("diagnostic=Cloudflare returned 403 even with CF Access headers configured.")
-        eprint("diagnostic_hint=check Access service-token policy, WAF Skip rule expression, and whether Bot Fight Mode is still enabled.")
+        eprint(
+            "diagnostic_hint=check Access service-token policy, WAF Skip rule expression, and whether Bot Fight Mode is still enabled."
+        )
     elif status == 429:
         eprint("diagnostic=rate limited. Check Cloudflare rate limiting/Bot rules and broker-side throttling.")
     elif status is not None and 520 <= status <= 526:
@@ -302,18 +307,31 @@ def exchange_session(base_url: str, headers: dict[str, str], oidc_token: str) ->
     if not isinstance(session_id, str) or not session_id:
         raise SystemExit("Broker exchange response did not include session_id")
     mask(session_id)
-    write_output("session_id", session_id)
     return session_id
 
 
-def request_repo_read(base_url: str, headers: dict[str, str], session_id: str) -> None:
-    target_repo = env("TARGET_REPO")
-    if not target_repo:
-        write_output("grant_id", "")
-        write_output("repo", "")
-        write_output("token", "")
-        write_output("expires_at", "")
-        return
+def read_target_repositories(value: str) -> list[str]:
+    """解析并去重目标仓库列表，拒绝不是 owner/repo 的输入。"""
+    repositories = list(dict.fromkeys(entry.strip() for entry in re.split(r"[\r\n,]+", value) if entry.strip()))
+    if value.strip() and not repositories:
+        raise SystemExit("target_repo must include at least one owner/repo entry")
+    for repository in repositories:
+        match = re.fullmatch(
+            r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/([A-Za-z0-9_.-]+)",
+            repository,
+        )
+        if match is None or match.group(1) in {".", ".."}:
+            raise SystemExit("Each target_repo entry must use owner/repo format")
+    return repositories
+
+
+def request_repo_read(
+    base_url: str,
+    headers: dict[str, str],
+    session_id: str,
+    target_repo: str,
+) -> dict[str, str]:
+    """使用指定 session 为单个仓库申请并校验只读凭据。"""
 
     payload = {
         "session_id": session_id,
@@ -333,25 +351,46 @@ def request_repo_read(base_url: str, headers: dict[str, str], session_id: str) -
     if not isinstance(data, dict):
         raise SystemExit(f"Broker repo-read response was not JSON, status={status}")
 
-    grant_id = data.get("grant_id")
-    repo = data.get("repo")
     token = data.get("token")
-    expires_at = data.get("expires_at")
-
-    if not isinstance(token, str) or not token:
+    if not isinstance(token, str) or not token or "\r" in token or "\n" in token:
         raise SystemExit("Broker repo-read response did not include token")
-
-    mask(session_id)
     mask(token)
 
-    write_output("grant_id", grant_id if isinstance(grant_id, str) else "")
-    write_output("repo", repo if isinstance(repo, str) else "")
-    write_output("token", token)
-    write_output("expires_at", expires_at if isinstance(expires_at, str) else "")
+    grant: dict[str, str] = {}
+    for field in ("grant_id", "repo", "token", "expires_at"):
+        value = data.get(field)
+        if not isinstance(value, str) or not value or "\r" in value or "\n" in value:
+            raise SystemExit(f"Broker repo-read response has an invalid {field}")
+        grant[field] = value
+    if grant["repo"] != target_repo:
+        raise SystemExit("Broker repo-read response does not match the requested repository")
+    return grant
+
+
+def request_repository_grants(
+    base_url: str,
+    headers: dict[str, str],
+    session_id: str,
+    repositories: list[str],
+) -> None:
+    """复用 session 逐仓库申请，全部成功后才输出凭据集合。"""
+    grants: dict[str, dict[str, str]] = {}
+    for repository in repositories:
+        try:
+            grants[repository] = request_repo_read(base_url, headers, session_id, repository)
+        except SystemExit:
+            eprint(f"Repo-read grant request failed for {repository}")
+            raise
+
+    write_output("repo_read_grants_json", json.dumps(grants, separators=(",", ":")))
+    single_grant = next(iter(grants.values())) if len(grants) == 1 else {}
+    for field in ("grant_id", "repo", "token", "expires_at"):
+        write_output(field, single_grant.get(field, ""))
 
 
 def main() -> int:
     validate_python_version()
+    repositories = read_target_repositories(env("TARGET_REPO"))
 
     base_url = normalize_base_url(require_env("BROKER_URL"))
     user_agent = env("BROKER_USER_AGENT", "auth-broker-x-ci/1.0")
@@ -367,9 +406,14 @@ def main() -> int:
     if probe:
         probe_health(base_url, headers)
 
-    oidc_token = get_github_oidc_token(env("BROKER_AUDIENCE", "cfw-zhi-auth-center"), user_agent)
-    session_id = exchange_session(base_url, headers, oidc_token)
-    request_repo_read(base_url, headers, session_id)
+    session_id = env("BROKER_SESSION_ID").strip()
+    if not session_id:
+        oidc_token = get_github_oidc_token(env("BROKER_AUDIENCE", "cfw-zhi-auth-center"), user_agent)
+        session_id = exchange_session(base_url, headers, oidc_token)
+    reject_header_value("BROKER_SESSION_ID", session_id)
+    mask(session_id)
+    write_output("session_id", session_id)
+    request_repository_grants(base_url, headers, session_id, repositories)
     return 0
 
 
