@@ -147,4 +147,4 @@ runs:
         fi
 
         "$PYTHON_BIN" -c 'import sys; print("python=" + sys.version.split()[0])'
-        "$PYTHON_BIN" "${{ github.action_path }}/scripts/broker_auth.py"
+        "$PYTHON_BIN" "$GITHUB_ACTION_PATH/scripts/broker_auth.py"
